@@ -13,16 +13,15 @@ const app = express();
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
-// Express Middleware Setup
+// Express Middleware
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const activeSessions = {};
-const transporters = new Map();
 
 /* ==========================================================================
-   ROOT ROUTE (Fixes Page Load & 500 Vercel Open Bug)
+   ROOT ROUTE
    ========================================================================== */
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -33,7 +32,6 @@ app.get('/', (req, res) => {
    ========================================================================== */
 async function verifyTurnstile(token, ip) {
   if (!TURNSTILE_SECRET_KEY) return true;
-
   try {
     const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
@@ -53,27 +51,24 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER POOLING (Socket Connection Reuse)
+   TRANSPORTER CREATOR (Optimized Direct TLS for Deliverability)
    ========================================================================== */
-function getTransporter(email, appPassword) {
+function createTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
-  const cacheKey = `${cleanEmail}_${appPassword}`;
-
-  if (!transporters.has(cacheKey)) {
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: cleanEmail, pass: appPassword },
-      pool: true,
-      maxConnections: 2,
-      maxMessages: 50
-    });
-    transporters.set(cacheKey, transporter);
-  }
-  return transporters.get(cacheKey);
+  return nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true, // Direct SSL/TLS connection
+    auth: { user: cleanEmail, pass: appPassword },
+    // Connection stability settings
+    connectionTimeout: 10000, 
+    greetingTimeout: 5000,
+    socketTimeout: 15000
+  });
 }
 
 /* ==========================================================================
-   SPINTAX PARSER ({Hi|Hello|Hey})
+   SPINTAX PARSER
    ========================================================================== */
 function parseSpintax(text) {
   if (!text) return "";
@@ -91,7 +86,7 @@ function parseSpintax(text) {
 }
 
 /* ==========================================================================
-   CLEAN PLAIN-TEXT FALLBACK (Dual Multipart MIME Support)
+   CLEAN PLAIN-TEXT CONVERTER (For High Deliverability Ratios)
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -135,7 +130,7 @@ app.post("/api/verify", async (req, res) => {
   }
 
   try {
-    const transporter = getTransporter(email, appPassword);
+    const transporter = createTransporter(email, appPassword);
     await transporter.verify();
     return res.json({ success: true, message: "SMTP verified successfully" });
   } catch (error) {
@@ -144,7 +139,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (SLOW HUMAN-LIKE PACING: 4-8 SECONDS DELAY)
+   SSE STREAM ROUTE (ENHANCED ANTI-SPAM HEADERS & PACING)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -171,8 +166,9 @@ app.post("/api/send-stream", async (req, res) => {
 
   const senderEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-
   activeSessions['global_stop'] = false;
+
+  const transporter = createTransporter(email, appPassword);
 
   for (let index = 0; index < recipients.length; index++) {
     if (activeSessions['global_stop']) {
@@ -183,20 +179,28 @@ app.post("/api/send-stream", async (req, res) => {
     const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
-    // Send HTTP keep-alive ping during slow delays to prevent connection drops
     res.write(': keep-alive\n\n');
 
     try {
-      const transporter = getTransporter(email, appPassword);
       const spunSubject = parseSpintax(subject);
       const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Clean, standard MIME structure without spammy custom headers
+      // Unique Message-ID generation for authentic headers
+      const domain = senderEmail.split('@')[1] || 'gmail.com';
+      const uniqueMsgId = `<${Date.now()}.${Math.random().toString(36).substring(2, 9)}@${domain}>`;
+
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
-        subject: spunSubject
+        subject: spunSubject,
+        messageId: uniqueMsgId,
+        headers: {
+          'X-Priority': '3',
+          'X-MSMail-Priority': 'Normal',
+          'Importance': 'Normal',
+          'X-Mailer': 'Microsoft Outlook 16.0' // Humanized client header
+        }
       };
 
       if (isHtml) {
@@ -214,14 +218,12 @@ app.post("/api/send-stream", async (req, res) => {
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // ORGANIC PACING: Random delay between 2.0s and 4.0s to simulate natural sending
+    // HUMAN-LIKE DELAY (1.5 to 3 Seconds Random Pause)
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(600 + Math.random() * 600);
-      
-      // Ping client every 2 seconds during the long wait to keep socket alive
-      const delayIntervals = Math.floor(randomDelay / 2000);
-      for (let i = 0; i < delayIntervals; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
+      const randomDelay = Math.floor(1500 + Math.random() * 2000);
+      const intervals = Math.floor(randomDelay / 1000);
+      for (let i = 0; i < intervals; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
         res.write(': keep-alive\n\n');
       }
     }
@@ -240,6 +242,6 @@ app.post("/api/stop", (req, res) => {
 });
 
 /* ==========================================================================
-   VERCEL HANDLER EXPORT
+   EXPORTS
    ========================================================================== */
 export default app;
