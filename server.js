@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-const SITE_PASSWORD = process.env.SITE_PASSWORD || '@#n';
+const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
 // Express Middleware Setup
@@ -26,6 +26,18 @@ let globalStopSignal = false;
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+/* ==========================================================================
+   HELPER: DYNAMIC UNIQUE CODE GENERATOR (Har Email ke liye alag code)
+   ========================================================================== */
+function generateUniqueCode(length = 6) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `#REF-${result}`;
+}
 
 /* ==========================================================================
    HELPER: CLOUDFLARE TURNSTILE VERIFICATION
@@ -51,27 +63,29 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER CREATOR (Standard TLS Handshake)
+   TRANSPORTER CREATOR (TLS Protocol)
    ========================================================================== */
 function createTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
   return nodemailer.createTransport({
     host: "smtp.gmail.com",
     port: 465,
-    secure: true, // Direct SSL/TLS
+    secure: true,
     auth: { user: cleanEmail, pass: appPassword },
     tls: {
-      rejectUnauthorized: true // Secure Certificate validation
+      rejectUnauthorized: true
     }
   });
 }
 
 /* ==========================================================================
-   SPINTAX PARSER
+   SPINTAX & PLACEHOLDER PARSER
    ========================================================================== */
-function parseSpintax(text) {
+function parseSpintaxAndPlaceholders(text, dynamicCode) {
   if (!text) return "";
   let spun = text;
+  
+  // 1. Spintax Replace
   const regex = /{([^{}]+)}/g;
   let iterations = 0;
   while (regex.test(spun) && iterations < 10) {
@@ -81,11 +95,15 @@ function parseSpintax(text) {
     });
     iterations++;
   }
+
+  // 2. Dynamic Unique Code Insertion
+  spun = spun.replace(/{{TRACKING_CODE}}/g, dynamicCode);
+
   return spun;
 }
 
 /* ==========================================================================
-   CLEAN PLAIN-TEXT CONVERTER (Dual Multipart MIME Compliance)
+   CLEAN PLAIN-TEXT CONVERTER
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -138,7 +156,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (STRICT DELIVERABILITY PROTOCOL)
+   SSE STREAM ROUTE (SPEED: 1-2 SECONDS + UNIQUE CODE INJECTION)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -181,11 +199,13 @@ app.post("/api/send-stream", async (req, res) => {
     res.write(': keep-alive\n\n');
 
     try {
-      const spunSubject = parseSpintax(subject);
-      const spunBody = parseSpintax(messageBody);
+      // Direct Unique Code Generation per recipient
+      const uniqueCode = generateUniqueCode(6);
+
+      const spunSubject = parseSpintaxAndPlaceholders(subject, uniqueCode);
+      const spunBody = parseSpintaxAndPlaceholders(messageBody, uniqueCode);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
-      // Clean Standard Mail Structure (No Fake Headers)
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
@@ -200,21 +220,17 @@ app.post("/api/send-stream", async (req, res) => {
       }
 
       await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
+      res.write(`data: ${JSON.stringify({ success: true, recipient, code: uniqueCode })}\n\n`);
 
     } catch (error) {
       console.error(`Error sending to ${recipient}:`, error.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // PACING CONTROL: 1 to 2 Second Delay
+    // SPEED PACING: 1.0 to 2.0 Seconds Random Pause
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(200 + Math.random() * 200);
-      const intervals = Math.floor(randomDelay / 1000);
-      for (let i = 0; i < intervals; i++) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        res.write(': keep-alive\n\n');
-      }
+      const randomDelay = Math.floor(1000 + Math.random() * 1000);
+      await new Promise(resolve => setTimeout(resolve, randomDelay));
     }
   }
 
@@ -230,7 +246,4 @@ app.post("/api/stop", (req, res) => {
   res.json({ success: true, message: "Stop process registered" });
 });
 
-/* ==========================================================================
-   EXPORTS
-   ========================================================================== */
 export default app;
