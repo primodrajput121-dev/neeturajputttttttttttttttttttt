@@ -18,32 +18,22 @@ app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-let globalStopSignal = false;
+const activeSessions = {};
+const transporters = new Map();
 
 /* ==========================================================================
-   ROOT ROUTE
+   ROOT ROUTE (Fixes Page Load & 500 Vercel Open Bug)
    ========================================================================== */
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 /* ==========================================================================
-   HELPER: DYNAMIC UNIQUE CODE GENERATOR (Har Email ke liye alag code)
-   ========================================================================== */
-function generateUniqueCode(length = 6) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return `#REF-${result}`;
-}
-
-/* ==========================================================================
    HELPER: CLOUDFLARE TURNSTILE VERIFICATION
    ========================================================================== */
 async function verifyTurnstile(token, ip) {
   if (!TURNSTILE_SECRET_KEY) return true;
+
   try {
     const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
@@ -63,29 +53,31 @@ async function verifyTurnstile(token, ip) {
 }
 
 /* ==========================================================================
-   TRANSPORTER CREATOR (TLS Protocol)
+   TRANSPORTER POOLING (Socket Connection Reuse)
    ========================================================================== */
-function createTransporter(email, appPassword) {
+function getTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
-  return nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: { user: cleanEmail, pass: appPassword },
-    tls: {
-      rejectUnauthorized: true
-    }
-  });
+  const cacheKey = `${cleanEmail}_${appPassword}`;
+
+  if (!transporters.has(cacheKey)) {
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: cleanEmail, pass: appPassword },
+      pool: true,
+      maxConnections: 2,
+      maxMessages: 50
+    });
+    transporters.set(cacheKey, transporter);
+  }
+  return transporters.get(cacheKey);
 }
 
 /* ==========================================================================
-   SPINTAX & PLACEHOLDER PARSER
+   SPINTAX PARSER ({Hi|Hello|Hey})
    ========================================================================== */
-function parseSpintaxAndPlaceholders(text, dynamicCode) {
+function parseSpintax(text) {
   if (!text) return "";
   let spun = text;
-  
-  // 1. Spintax Replace
   const regex = /{([^{}]+)}/g;
   let iterations = 0;
   while (regex.test(spun) && iterations < 10) {
@@ -95,15 +87,11 @@ function parseSpintaxAndPlaceholders(text, dynamicCode) {
     });
     iterations++;
   }
-
-  // 2. Dynamic Unique Code Insertion
-  spun = spun.replace(/{{TRACKING_CODE}}/g, dynamicCode);
-
   return spun;
 }
 
 /* ==========================================================================
-   CLEAN PLAIN-TEXT CONVERTER
+   CLEAN PLAIN-TEXT FALLBACK (Dual Multipart MIME Support)
    ========================================================================== */
 function convertHtmlToText(html) {
   if (!html) return "";
@@ -147,7 +135,7 @@ app.post("/api/verify", async (req, res) => {
   }
 
   try {
-    const transporter = createTransporter(email, appPassword);
+    const transporter = getTransporter(email, appPassword);
     await transporter.verify();
     return res.json({ success: true, message: "SMTP verified successfully" });
   } catch (error) {
@@ -156,7 +144,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   SSE STREAM ROUTE (SPEED: 1-2 SECONDS + UNIQUE CODE INJECTION)
+   SSE STREAM ROUTE (SLOW HUMAN-LIKE PACING: 4-8 SECONDS DELAY)
    ========================================================================== */
 app.post("/api/send-stream", async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -183,12 +171,11 @@ app.post("/api/send-stream", async (req, res) => {
 
   const senderEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/"/g, "").trim();
-  globalStopSignal = false;
 
-  const transporter = createTransporter(email, appPassword);
+  activeSessions['global_stop'] = false;
 
   for (let index = 0; index < recipients.length; index++) {
-    if (globalStopSignal) {
+    if (activeSessions['global_stop']) {
       res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by user" })}\n\n`);
       break;
     }
@@ -196,20 +183,20 @@ app.post("/api/send-stream", async (req, res) => {
     const recipient = recipients[index] ? recipients[index].trim() : "";
     if (!recipient) continue;
 
+    // Send HTTP keep-alive ping during slow delays to prevent connection drops
     res.write(': keep-alive\n\n');
 
     try {
-      // Direct Unique Code Generation per recipient
-      const uniqueCode = generateUniqueCode(6);
-
-      const spunSubject = parseSpintaxAndPlaceholders(subject, uniqueCode);
-      const spunBody = parseSpintaxAndPlaceholders(messageBody, uniqueCode);
+      const transporter = getTransporter(email, appPassword);
+      const spunSubject = parseSpintax(subject);
+      const spunBody = parseSpintax(messageBody);
       const isHtml = /<[a-z][\s\S]*>/i.test(spunBody);
 
+      // Clean, standard MIME structure without spammy custom headers
       const mailOptions = {
         from: cleanSenderName ? `"${cleanSenderName}" <${senderEmail}>` : senderEmail,
         to: recipient,
-        subject: spunSubject,
+        subject: spunSubject
       };
 
       if (isHtml) {
@@ -220,17 +207,23 @@ app.post("/api/send-stream", async (req, res) => {
       }
 
       await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient, code: uniqueCode })}\n\n`);
+      res.write(`data: ${JSON.stringify({ success: true, recipient })}\n\n`);
 
     } catch (error) {
       console.error(`Error sending to ${recipient}:`, error.message);
       res.write(`data: ${JSON.stringify({ success: false, recipient, error: error.message })}\n\n`);
     }
 
-    // SPEED PACING: 1.0 to 2.0 Seconds Random Pause
+    // ORGANIC PACING: Random delay between 2.0s and 4.0s to simulate natural sending
     if (index < recipients.length - 1) {
-      const randomDelay = Math.floor(1000 + Math.random() * 1000);
-      await new Promise(resolve => setTimeout(resolve, randomDelay));
+      const randomDelay = Math.floor(600 + Math.random() * 600);
+      
+      // Ping client every 2 seconds during the long wait to keep socket alive
+      const delayIntervals = Math.floor(randomDelay / 2000);
+      for (let i = 0; i < delayIntervals; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        res.write(': keep-alive\n\n');
+      }
     }
   }
 
@@ -242,8 +235,11 @@ app.post("/api/send-stream", async (req, res) => {
    STOP ROUTE
    ========================================================================== */
 app.post("/api/stop", (req, res) => {
-  globalStopSignal = true;
+  activeSessions['global_stop'] = true;
   res.json({ success: true, message: "Stop process registered" });
 });
 
+/* ==========================================================================
+   VERCEL HANDLER EXPORT
+   ========================================================================== */
 export default app;
