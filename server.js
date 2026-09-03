@@ -13,47 +13,37 @@ const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
 let globalStopRequested = false;
-const poolMap = new Map();
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   1. HIGH DELIVERABILITY TRANSPORTER (OPTIMIZED FOR BATCHING)
+   1. TRANSPORTER CREATOR (Vercel-Safe Non-Pooling Connection)
    ========================================================================== */
-function getPort587Transporter(email, appPassword) {
+function createTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
   const cleanPass = appPassword.replace(/\s+/g, '').trim();
-  const key = `port587_${cleanEmail}_${cleanPass}`;
 
-  if (!poolMap.has(key)) {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false, // STARTTLS connection
-      requireTLS: true,
-      auth: {
-        user: cleanEmail,
-        pass: cleanPass
-      },
-      pool: true,
-      maxConnections: 6, // 6 concurrent connections for batch sending
-      maxMessages: 500,
-      socketTimeout: 30000,
-      connectionTimeout: 30000
-    });
-
-    poolMap.set(key, transporter);
-  }
-
-  return poolMap.get(key);
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // STARTTLS
+    requireTLS: true,
+    auth: {
+      user: cleanEmail,
+      pass: cleanPass
+    },
+    // Vercel serverless environment works better without heavy connection pooling
+    pool: false,
+    socketTimeout: 20000,
+    connectionTimeout: 20000
+  });
 }
 
 /* ==========================================================================
    2. HUMAN BEHAVIOR & CONTENT ENGINES
    ========================================================================== */
-
 function generateInvisibleFingerprint() {
   const zwChars = ['\u200B', '\u200C', '\u200D', '\uFEFF'];
   let fingerprint = '';
@@ -143,7 +133,6 @@ function personalizeContent(template, recipient) {
   if (!template) return "";
   let content = parseSpintax(template);
   const fallback = recipient.firstName || recipient.name || 'there';
-
   const currentDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
   content = content.replace(/{Name}/gi, recipient.name || fallback);
@@ -195,7 +184,7 @@ app.post("/api/verify", async (req, res) => {
   }
 
   try {
-    const transporter = getPort587Transporter(email, appPassword);
+    const transporter = createTransporter(email, appPassword);
     await transporter.verify();
     return res.json({ success: true, message: "SMTP verified successfully" });
   } catch (error) {
@@ -204,7 +193,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. STREAMING ENGINE (6 Emails per batch with 1-2 sec Delay)
+   4. STREAMING ENGINE (6 Emails Simultaneously + 1-2 Sec Pause)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -223,24 +212,16 @@ app.post('/api/send-stream', async (req, res) => {
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/["\r\n]/g, "").trim();
   globalStopRequested = false;
-  let isClientDisconnected = false;
+  let isClientClosed = false;
 
-  // Stop process if browser/client closes connection
   req.on('close', () => {
-    isClientDisconnected = true;
+    isClientClosed = true;
   });
 
-  const keepAlivePing = setInterval(() => {
-    if (!isClientDisconnected) {
-      try { res.write(': keep-alive\n\n'); } catch {}
-    }
-  }, 4000);
-
-  const transporter = getPort587Transporter(email, appPassword);
+  const transporter = createTransporter(email, appPassword);
   const BATCH_SIZE = 6;
 
-  // Helper Function: Single Email Sending Logic
-  const sendSingleMail = async (rawRecipient) => {
+  const sendMailItem = async (rawRecipient) => {
     const recipient = parseRecipientData(rawRecipient);
     if (!recipient.email) return;
 
@@ -276,40 +257,33 @@ app.post('/api/send-stream', async (req, res) => {
 
     try {
       await transporter.sendMail(mailOptions);
-      if (!isClientDisconnected) {
+      if (!isClientClosed) {
         res.write(`data: ${JSON.stringify({ success: true, recipient: recipient.email, name: recipient.name })}\n\n`);
       }
     } catch (err) {
-      console.error(`Send Failure [${recipient.email}]:`, err.message);
-      if (!isClientDisconnected) {
+      if (!isClientClosed) {
         res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
       }
     }
   };
 
-  // Process in Batches of 6
+  // Loop through recipients in batches of 6
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
-    if (globalStopRequested || isClientDisconnected) {
-      if (!isClientDisconnected) {
-        res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
-      }
-      break;
-    }
+    if (globalStopRequested || isClientClosed) break;
 
     const currentBatch = recipients.slice(i, i + BATCH_SIZE);
     
-    // Execute 6 emails simultaneously
-    await Promise.allSettled(currentBatch.map(recipient => sendSingleMail(recipient)));
+    // Send 6 emails in parallel
+    await Promise.allSettled(currentBatch.map(item => sendMailItem(item)));
 
-    // Apply 1 - 2 second delay after every batch of 6 emails
-    if (i + BATCH_SIZE < recipients.length && !globalStopRequested && !isClientDisconnected) {
-      const batchDelay = Math.floor(1000 + Math.random() * 1000); // 1000ms to 2000ms delay
-      await new Promise(resolve => setTimeout(resolve, batchDelay));
+    // 1-2 sec random delay after each batch of 6
+    if (i + BATCH_SIZE < recipients.length && !globalStopRequested && !isClientClosed) {
+      const delay = Math.floor(1000 + Math.random() * 1000);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
-  clearInterval(keepAlivePing);
-  if (!isClientDisconnected) {
+  if (!isClientClosed) {
     res.write("data: [DONE]\n\n");
     res.end();
   }
@@ -321,7 +295,7 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on Port ${PORT} [6-Email Batching Enabled]`);
+  console.log(`Server running on Port ${PORT}`);
 });
 
 export default app;
