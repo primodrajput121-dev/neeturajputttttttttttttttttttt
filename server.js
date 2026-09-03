@@ -34,10 +34,9 @@ function createTransporter(email, appPassword) {
       user: cleanEmail,
       pass: cleanPass
     },
-    // Vercel serverless environment works better without heavy connection pooling
     pool: false,
-    socketTimeout: 20000,
-    connectionTimeout: 20000
+    socketTimeout: 25000,
+    connectionTimeout: 25000
   });
 }
 
@@ -193,7 +192,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. STREAMING ENGINE (6 Emails Simultaneously + 1-2 Sec Pause)
+   4. STREAMING ENGINE (6 Emails Batch + 1-2 Sec Random Delay)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -267,16 +266,12 @@ app.post('/api/send-stream', async (req, res) => {
     }
   };
 
-  // Loop through recipients in batches of 6
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalStopRequested || isClientClosed) break;
 
     const currentBatch = recipients.slice(i, i + BATCH_SIZE);
-    
-    // Send 6 emails in parallel
     await Promise.allSettled(currentBatch.map(item => sendMailItem(item)));
 
-    // 1-2 sec random delay after each batch of 6
     if (i + BATCH_SIZE < recipients.length && !globalStopRequested && !isClientClosed) {
       const delay = Math.floor(1000 + Math.random() * 1000);
       await new Promise(resolve => setTimeout(resolve, delay));
