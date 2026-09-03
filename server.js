@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
-const globalSession = { stopRequested: false };
+let globalStopRequested = false;
 const poolMap = new Map();
 
 app.use(cors());
@@ -20,7 +20,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 /* ==========================================================================
-   1. HIGH DELIVERABILITY TRANSPORTER (STARTTLS + SMTP POOL)
+   1. HIGH DELIVERABILITY TRANSPORTER (OPTIMIZED FOR BATCHING)
    ========================================================================== */
 function getPort587Transporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
@@ -38,7 +38,7 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 3,
+      maxConnections: 6, // 6 concurrent connections for batch sending
       maxMessages: 500,
       socketTimeout: 30000,
       connectionTimeout: 30000
@@ -204,7 +204,7 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ==========================================================================
-   4. STREAMING ENGINE (UTC Time Sync & Natural Random Delays)
+   4. STREAMING ENGINE (6 Emails per batch with 1-2 sec Delay)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -222,84 +222,106 @@ app.post('/api/send-stream', async (req, res) => {
 
   const cleanEmail = email.toLowerCase().trim();
   const cleanSenderName = (senderName || "").replace(/["\r\n]/g, "").trim();
-  globalSession.stopRequested = false;
+  globalStopRequested = false;
+  let isClientDisconnected = false;
+
+  // Stop process if browser/client closes connection
+  req.on('close', () => {
+    isClientDisconnected = true;
+  });
 
   const keepAlivePing = setInterval(() => {
-    try { res.write(': keep-alive\n\n'); } catch {}
+    if (!isClientDisconnected) {
+      try { res.write(': keep-alive\n\n'); } catch {}
+    }
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
+  const BATCH_SIZE = 6;
 
-  for (let i = 0; i < recipients.length; i++) {
-    if (globalSession.stopRequested) {
-      res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
+  // Helper Function: Single Email Sending Logic
+  const sendSingleMail = async (rawRecipient) => {
+    const recipient = parseRecipientData(rawRecipient);
+    if (!recipient.email) return;
+
+    const personalizedSubject = personalizeContent(subject, recipient);
+    const personalizedBody = personalizeContent(messageBody, recipient);
+    const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
+
+    const invisibleHash = generateInvisibleFingerprint();
+    const organicCTA = getOrganicCallToAction();
+    const preciseUtcDate = new Date().toUTCString();
+
+    const mailOptions = {
+      from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
+      to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
+      replyTo: cleanEmail,
+      date: preciseUtcDate,
+      subject: personalizedSubject || 'Hello'
+    };
+
+    if (isHtml) {
+      mailOptions.html = `
+        <div dir="ltr">
+          ${personalizedBody}
+          <br><br>
+          <p style="font-size: 13px; color: #444444; margin-top: 15px;">${organicCTA}</p>
+          <span style="display:none !important; font-size:0px; line-height:0px; opacity:0; color:transparent;">${invisibleHash}</span>
+        </div>
+      `;
+      mailOptions.text = createPlainTextFromHtml(personalizedBody) + `\n\n${organicCTA}`;
+    } else {
+      mailOptions.text = personalizedBody + `\n\n${organicCTA}` + `\n` + invisibleHash;
+    }
+
+    try {
+      await transporter.sendMail(mailOptions);
+      if (!isClientDisconnected) {
+        res.write(`data: ${JSON.stringify({ success: true, recipient: recipient.email, name: recipient.name })}\n\n`);
+      }
+    } catch (err) {
+      console.error(`Send Failure [${recipient.email}]:`, err.message);
+      if (!isClientDisconnected) {
+        res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
+      }
+    }
+  };
+
+  // Process in Batches of 6
+  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+    if (globalStopRequested || isClientDisconnected) {
+      if (!isClientDisconnected) {
+        res.write(`data: ${JSON.stringify({ success: false, error: "Stopped by User" })}\n\n`);
+      }
       break;
     }
 
-    const recipient = parseRecipientData(recipients[i]);
-    if (!recipient.email) continue;
+    const currentBatch = recipients.slice(i, i + BATCH_SIZE);
+    
+    // Execute 6 emails simultaneously
+    await Promise.allSettled(currentBatch.map(recipient => sendSingleMail(recipient)));
 
-    try {
-      const personalizedSubject = personalizeContent(subject, recipient);
-      const personalizedBody = personalizeContent(messageBody, recipient);
-      const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-      const invisibleHash = generateInvisibleFingerprint();
-      const organicCTA = getOrganicCallToAction();
-
-      // Explicit UTC RFC2822 Date format fixes "Incorrect Device Time" errors
-      const preciseUtcDate = new Date().toUTCString();
-
-      const mailOptions = {
-        from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
-        to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
-        replyTo: cleanEmail,
-        date: preciseUtcDate,
-        subject: personalizedSubject || 'Hello'
-      };
-
-      if (isHtml) {
-        const bodyWithPsAndHash = `
-          <div dir="ltr">
-            ${personalizedBody}
-            <br><br>
-            <p style="font-size: 13px; color: #444444; margin-top: 15px;">${organicCTA}</p>
-            <span style="display:none !important; font-size:0px; line-height:0px; opacity:0; color:transparent;">${invisibleHash}</span>
-          </div>
-        `;
-        mailOptions.html = bodyWithPsAndHash;
-        mailOptions.text = createPlainTextFromHtml(personalizedBody) + `\n\n${organicCTA}`;
-      } else {
-        mailOptions.text = personalizedBody + `\n\n${organicCTA}` + `\n` + invisibleHash;
-      }
-
-      await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient: recipient.email, name: recipient.name })}\n\n`);
-
-    } catch (err) {
-      console.error(`Send Failure [${recipient.email}]:`, err.message);
-      res.write(`data: ${JSON.stringify({ success: false, recipient: recipient.email, error: err.message })}\n\n`);
-    }
-
-    // Dynamic 1200ms - 2200ms randomized human sending interval
-    if (i < recipients.length - 1) {
-      const naturalDelay = Math.floor(1200 + Math.random() * 1000);
-      await new Promise(resolve => setTimeout(resolve, naturalDelay));
+    // Apply 1 - 2 second delay after every batch of 6 emails
+    if (i + BATCH_SIZE < recipients.length && !globalStopRequested && !isClientDisconnected) {
+      const batchDelay = Math.floor(1000 + Math.random() * 1000); // 1000ms to 2000ms delay
+      await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
 
   clearInterval(keepAlivePing);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  if (!isClientDisconnected) {
+    res.write("data: [DONE]\n\n");
+    res.end();
+  }
 });
 
 app.post('/api/stop', (req, res) => {
-  globalSession.stopRequested = true;
+  globalStopRequested = true;
   res.json({ success: true, message: "Sending process stopped" });
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on Port ${PORT} [UTC Time Fixed]`);
+  console.log(`Server running on Port ${PORT} [6-Email Batching Enabled]`);
 });
 
 export default app;
