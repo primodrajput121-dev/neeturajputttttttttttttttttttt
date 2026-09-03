@@ -3,6 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -67,8 +68,8 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 4, // Aligned with 4-batch processing
-      maxMessages: 500,
+      maxConnections: 8, // Set to 8 to support fast parallel sending
+      maxMessages: 1000,
       socketTimeout: 30000,
       connectionTimeout: 30000
     });
@@ -78,8 +79,12 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   RECIPIENT NORMALIZATION & SPINTAX RESOLVER
+   RECIPIENT NORMALIZATION, SPINTAX & REF-CODE GENERATOR
    ========================================================================== */
+function generateRefCode() {
+  return `[Ref-ID: ${crypto.randomBytes(3).toString('hex').toUpperCase()}]`;
+}
+
 function parseRecipientData(input) {
   let email = '';
   let rawName = '';
@@ -219,7 +224,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   STREAMING DISPATCH ROUTE (4 Emails Per Batch)
+   STREAMING DISPATCH ROUTE (8 Emails Per Batch + 1-2 Sec Gap)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -254,7 +259,7 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 4; // Exact 4 emails per batch
+  const BATCH_SIZE = 8; // Exact 8 emails per batch
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -271,17 +276,17 @@ app.post('/api/send-stream', async (req, res) => {
       try {
         const personalizedSubject = personalizeContent(subject, recipient);
         const personalizedBody = personalizeContent(messageBody, recipient);
+        const refCode = generateRefCode();
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-        // 2-line top gap + 15px font + #0f172a deep dark text
         let formattedHtml = '';
         if (isHtml) {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody}</div>`;
+          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody}<br><br><span style="font-size:11px;color:#888888;font-family:monospace;">${refCode}</span></div>`;
         } else {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
+          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody.replace(/\n/g, '<br>')}<br><br><span style="font-size:11px;color:#888888;font-family:monospace;">${refCode}</span></div>`;
         }
 
-        const plainTextFormatted = `\n\n${createPlainTextFromHtml(formattedHtml)}`;
+        const plainTextFormatted = `${createPlainTextFromHtml(personalizedBody)}\n\n${refCode}`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
@@ -308,9 +313,9 @@ app.post('/api/send-stream', async (req, res) => {
       }
     }
 
-    // Delay between 4-email batches
+    // Delay between 8-email batches: 1 to 2 seconds (1000ms - 2000ms)
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(350 + Math.random() * 50);
+      const batchDelay = Math.floor(1000 + Math.random() * 1000);
       await new Promise(resolve => setTimeout(resolve, batchDelay));
     }
   }
