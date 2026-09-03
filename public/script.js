@@ -267,7 +267,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                         updateProgressUI(sentCount, failedCount, recipientsToSend.length, `Failed: ${event.recipient}`);
                                     }
                                 } catch (e) {
-                                    // Ignore keep-alive pings
+                                    // Non-JSON SSE frames ignored
                                 }
                             }
                         }
