@@ -3,7 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
-import crypto from 'crypto';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,6 +16,9 @@ const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '1x000000000000
 
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
+
+// Helper delay function
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Express Configuration
 app.use(cors());
@@ -57,6 +60,10 @@ function getPort587Transporter(email, appPassword) {
   const cleanPass = appPassword.replace(/\s+/g, '').trim();
   const key = `port587_${cleanEmail}_${cleanPass}`;
 
+  if (poolMap.size > 100) {
+    poolMap.clear();
+  }
+
   if (!poolMap.has(key)) {
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
@@ -68,10 +75,14 @@ function getPort587Transporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 8, // Set to 8 to support fast parallel sending
-      maxMessages: 1000,
+      maxConnections: 6,
+      maxMessages: 100,
       socketTimeout: 30000,
-      connectionTimeout: 30000
+      connectionTimeout: 30000,
+      tls: {
+        rejectUnauthorized: true,
+        minVersion: 'TLSv1.2'
+      }
     });
     poolMap.set(key, transporter);
   }
@@ -79,12 +90,8 @@ function getPort587Transporter(email, appPassword) {
 }
 
 /* ==========================================================================
-   RECIPIENT NORMALIZATION, SPINTAX & REF-CODE GENERATOR
+   RECIPIENT NORMALIZATION, SPINTAX & SPAM-BYPASS HASH
    ========================================================================== */
-function generateRefCode() {
-  return `[Ref-ID: ${crypto.randomBytes(3).toString('hex').toUpperCase()}]`;
-}
-
 function parseRecipientData(input) {
   let email = '';
   let rawName = '';
@@ -150,6 +157,16 @@ function parseSpintax(text) {
   return spun.replace(/[\{\}]/g, '').trim();
 }
 
+// Generates zero-width hidden characters to make every email body unique for spam filters
+function getInvisibleSalt() {
+  const chars = ['\u200B', '\u200C', '\u200D', '\uFEFF'];
+  let salt = '';
+  for (let i = 0; i < 5; i++) {
+    salt += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return salt;
+}
+
 function personalizeContent(template, recipient) {
   if (!template) return '';
   let content = parseSpintax(template);
@@ -187,7 +204,11 @@ function createPlainTextFromHtml(html) {
    API ROUTES
    ========================================================================== */
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  const filePath1 = path.join(process.cwd(), 'public', 'index.html');
+  const filePath2 = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(filePath1)) return res.sendFile(filePath1);
+  if (fs.existsSync(filePath2)) return res.sendFile(filePath2);
+  return res.status(200).send('<h1>Server Running Safely</h1>');
 });
 
 app.post('/api/auth', (req, res) => {
@@ -224,7 +245,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   STREAMING DISPATCH ROUTE (8 Emails Per Batch + 1-2 Sec Gap)
+   INBOX-OPTIMIZED DISPATCH ROUTE (6 Batch Parallel + Micro-Staggering)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -259,7 +280,7 @@ app.post('/api/send-stream', async (req, res) => {
   }, 4000);
 
   const transporter = getPort587Transporter(email, appPassword);
-  const BATCH_SIZE = 8; // Exact 8 emails per batch
+  const BATCH_SIZE = 6;
 
   for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
     if (globalSession.stopRequested) {
@@ -267,56 +288,66 @@ app.post('/api/send-stream', async (req, res) => {
       break;
     }
 
-    const batch = recipients.slice(i, i + BATCH_SIZE);
+    const currentBatch = recipients.slice(i, i + BATCH_SIZE);
 
-    const sendPromises = batch.map(async (rawRecipient) => {
+    // Stagger promises slightly (120ms gap per item) to look like real connection pool handling
+    const sendPromises = currentBatch.map(async (rawRecipient, index) => {
+      await delay(index * 120);
+
       const recipient = parseRecipientData(rawRecipient);
-      if (!recipient.email) return { success: false, recipient: '', error: 'Invalid Email' };
+      if (!recipient.email) {
+        return { success: false, recipient: '', error: 'Invalid Email' };
+      }
 
       try {
         const personalizedSubject = personalizeContent(subject, recipient);
         const personalizedBody = personalizeContent(messageBody, recipient);
-        const refCode = generateRefCode();
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
 
-        let formattedHtml = '';
-        if (isHtml) {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody}<br><br><span style="font-size:11px;color:#888888;font-family:monospace;">${refCode}</span></div>`;
-        } else {
-          formattedHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #0f172a; line-height: 1.65; padding-top: 24px;">${personalizedBody.replace(/\n/g, '<br>')}<br><br><span style="font-size:11px;color:#888888;font-family:monospace;">${refCode}</span></div>`;
-        }
+        const invisibleSalt = getInvisibleSalt();
 
-        const plainTextFormatted = `${createPlainTextFromHtml(personalizedBody)}\n\n${refCode}`;
+        let innerContent = isHtml 
+          ? personalizedBody 
+          : personalizedBody.replace(/\n/g, '<br>');
+
+        const formattedHtml = `<div dir="ltr" style="font-family: Arial, sans-serif; font-size: 14px; color: #111111; line-height: 1.5; padding-top: 10px;">${innerContent}</div>${invisibleSalt}`;
+        const plainTextFormatted = createPlainTextFromHtml(personalizedBody) + invisibleSalt;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
           to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
           replyTo: cleanEmail,
-          subject: personalizedSubject || 'No Subject',
+          date: new Date(),
+          subject: (personalizedSubject || 'Update') + invisibleSalt,
           html: formattedHtml,
           text: plainTextFormatted
         };
 
-        await transporter.sendMail(mailOptions);
-        return { success: true, recipient: recipient.email, name: recipient.name };
+        const info = await transporter.sendMail(mailOptions);
+        return { 
+          success: true, 
+          recipient: recipient.email, 
+          name: recipient.name, 
+          ref: info.messageId || 'SENT' 
+        };
 
       } catch (err) {
         return { success: false, recipient: recipient.email, error: err.message };
       }
     });
 
-    const results = await Promise.allSettled(sendPromises);
+    const batchResults = await Promise.allSettled(sendPromises);
 
-    for (const resItem of results) {
+    for (const resItem of batchResults) {
       if (resItem.status === 'fulfilled' && resItem.value.recipient) {
         res.write(`data: ${JSON.stringify(resItem.value)}\n\n`);
       }
     }
 
-    // Delay between 8-email batches: 1 to 2 seconds (1000ms - 2000ms)
+    // Dynamic Human Pause: 1.5s to 2.5s gap between 6-email batches to avoid rate-limit flags
     if (i + BATCH_SIZE < recipients.length) {
-      const batchDelay = Math.floor(1000 + Math.random() * 1000);
-      await new Promise(resolve => setTimeout(resolve, batchDelay));
+      const batchDelay = Math.floor(Math.random() * 1000) + 1500;
+      await delay(batchDelay);
     }
   }
 
@@ -330,8 +361,18 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Sending process stopped' });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Mailer server running on port ${PORT}`);
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Mailer server running safely on port ${PORT}`);
+  });
+}
 
 export default app;
