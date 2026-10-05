@@ -3,7 +3,6 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,22 +15,20 @@ const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 /* ==========================================================================
-   1. DIRECT GMAIL TRANSPORTER POOLING
+   1. CLEAN DIRECT GMAIL TRANSPORTER (NO PROXY, PROPER POOL REUSE)
    ========================================================================== */
 function closeAllPools() {
   for (const [key, transporter] of poolMap.entries()) {
     try {
       transporter.close();
     } catch (e) {
-      // Ignore errors
+      // Ignore close errors
     }
     poolMap.delete(key);
   }
@@ -40,9 +37,10 @@ function closeAllPools() {
 function getNativeTransporter(email, appPassword) {
   const cleanEmail = email.toLowerCase().trim();
   const cleanPass = appPassword.replace(/\s+/g, '').trim();
+  const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
   const key = `native_${cleanEmail}_${cleanPass}`;
 
-  // Close other active pools if changing sender accounts
+  // Close old pool if switching to a different Gmail account
   for (const [existingKey, existingTransporter] of poolMap.entries()) {
     if (existingKey !== key) {
       try {
@@ -59,12 +57,13 @@ function getNativeTransporter(email, appPassword) {
       host: 'smtp.gmail.com',
       port: 465,
       secure: true,
+      name: senderDomain,
       auth: {
         user: cleanEmail,
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 3,
+      maxConnections: 4,
       maxMessages: 100,
       socketTimeout: 30000,
       connectionTimeout: 30000,
@@ -213,11 +212,13 @@ function stripHtmlTags(htmlString) {
 /* ==========================================================================
    3. API ROUTES
    ========================================================================== */
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 app.post('/api/auth', (req, res) => {
   const { password } = req.body;
-  if (password === SITE_PASSWORD || password === 'Y##') {
-    return res.json({ success: true, message: 'Authorized' });
-  }
+  if (password === SITE_PASSWORD) return res.json({ success: true, message: 'Authorized' });
   return res.status(401).json({ success: false, message: 'Unauthorized Password' });
 });
 
@@ -246,7 +247,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 /* ==========================================================================
-   4. STREAMING ROUTE (SAME SPEED LOGIC RETAINED)
+   4. NON-STOP STREAMING ROUTE (BLITZ SIZE = 4)
    ========================================================================== */
 app.post('/api/send-stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -272,10 +273,10 @@ app.post('/api/send-stream', async (req, res) => {
     } catch (e) {
       // Ignored
     }
-  }, 3000);
+  }, 2500);
 
-  const defaultSubject = 'Quick question';
-  const defaultBody = 'Your site looks great, but a small issue is keeping it from showing in top results.';
+  const defaultSubject = '{Quick question|Site Overview|Quick note}';
+  const defaultBody = `Your site looks great, but a small issue is keeping it from showing in the top results. Can I send a screenshot?`;
 
   const finalSubjectTemplate = (subject && subject.trim()) ? subject : defaultSubject;
   const rawBodyTemplate = (messageBody && messageBody.trim()) ? messageBody : defaultBody;
@@ -283,16 +284,17 @@ app.post('/api/send-stream', async (req, res) => {
   let templateDeck = extractTemplateDeck(rawBodyTemplate);
   let deckIndex = 0;
 
+  // Single shared connection pool for the entire session (fixes per-email login flood)
   const transporter = getNativeTransporter(email, appPassword);
-  const BATCH_SIZE = 2; // Maintained speed setting
+  const BLITZ_SIZE = 4;
 
-  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+  for (let i = 0; i < recipients.length; i += BLITZ_SIZE) {
     if (globalSession.stopRequested) {
       res.write(`data: ${JSON.stringify({ success: false, error: 'Stopped by User' })}\n\n`);
       break;
     }
 
-    const blitzBatch = recipients.slice(i, i + BATCH_SIZE);
+    const blitzBatch = recipients.slice(i, i + BLITZ_SIZE);
 
     const blitzTasks = blitzBatch.map(async (rawRecipient, idx) => {
       if (globalSession.stopRequested) return;
@@ -300,31 +302,29 @@ app.post('/api/send-stream', async (req, res) => {
       const recipient = parseRecipientData(rawRecipient);
       if (!recipient.email) return;
 
-      // Safe deck index retrieval
-      const currentLine = templateDeck[deckIndex % templateDeck.length];
-      deckIndex++;
+      if (deckIndex >= templateDeck.length) {
+        templateDeck = shuffleArray(templateDeck);
+        deckIndex = 0;
+      }
+      const selectedBodyLine = templateDeck[deckIndex++];
 
       try {
         if (idx > 0) {
-          await delay(idx * 300); // 300ms offset retained
+          await new Promise(resolve => setTimeout(resolve, idx * 90));
         }
 
         const personalizedSubject = personalizeContent(finalSubjectTemplate, recipient);
-        const personalizedBody = personalizeContent(currentLine, recipient);
+        const personalizedBody = personalizeContent(selectedBodyLine, recipient);
         const isHtml = /<[a-z][\s\S]*>/i.test(personalizedBody);
-
-        const plainTextBody = isHtml ? stripHtmlTags(personalizedBody) : personalizedBody;
-        const htmlBody = isHtml 
-          ? personalizedBody 
-          : `<div style="font-family: sans-serif; font-size: 14px; color: #000;">${personalizedBody.replace(/\n/g, '<br>')}</div>`;
 
         const mailOptions = {
           from: cleanSenderName ? `"${cleanSenderName}" <${cleanEmail}>` : cleanEmail,
           to: recipient.name ? `"${recipient.name}" <${recipient.email}>` : recipient.email,
           replyTo: cleanEmail,
           subject: personalizedSubject,
-          text: plainTextBody,
-          html: htmlBody
+          textEncoding: 'quoted-printable',
+          text: isHtml ? stripHtmlTags(personalizedBody) : personalizedBody,
+          html: isHtml ? `<div dir="ltr">${personalizedBody}</div>` : `<div dir="ltr">${personalizedBody.replace(/\n/g, '<br>')}</div>`
         };
 
         await transporter.sendMail(mailOptions);
@@ -340,8 +340,8 @@ app.post('/api/send-stream', async (req, res) => {
 
     await Promise.allSettled(blitzTasks);
 
-    if (i + BATCH_SIZE < recipients.length && !globalSession.stopRequested) {
-      await delay(2000); // 2-second inter-batch delay retained
+    if (i + BLITZ_SIZE < recipients.length && !globalSession.stopRequested) {
+      await new Promise(resolve => setTimeout(resolve, 180));
     }
   }
 
@@ -357,18 +357,8 @@ app.post('/api/stop', (req, res) => {
   res.json({ success: true, message: 'Stopped by User' });
 });
 
-app.get('*', (req, res) => {
-  const filePath = path.join(__dirname, 'public', 'index.html');
-  if (fs.existsSync(filePath)) {
-    return res.sendFile(filePath);
-  }
-  return res.status(200).send('OK');
+app.listen(PORT, () => {
+  console.log(`🚀 Non-stop Blitz Mailer running on port ${PORT}`);
 });
-
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-  app.listen(PORT, () => {
-    console.log(`🚀 Mailer server running on port ${PORT}`);
-  });
-}
 
 export default app;
