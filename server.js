@@ -2,34 +2,29 @@ import 'dotenv/config';
 import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Middlewares
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* ==========================================================================
-   SMTP TRANSPORTER CONFIGURATION
-   ========================================================================== */
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.example.com',
-  port: parseInt(process.env.SMTP_PORT || '587', 10),
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
+// 'public' फ़ोल्डर की स्टैटिक फ़ाइलों को सर्व करें
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Root URL पर HTML फ़ाइल दिखाएं
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public', 'index.html'));
 });
 
 /* ==========================================================================
    API ROUTES
    ========================================================================== */
-app.get('/', (req, res) => {
-  res.send('Server is running on Vercel!');
-});
-
 app.post('/api/send-email', async (req, res) => {
   const { to, subject, htmlContent, textContent } = req.body;
 
@@ -41,6 +36,16 @@ app.post('/api/send-email', async (req, res) => {
   }
 
   try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587', 10),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+
     const mailOptions = {
       from: `"${process.env.SENDER_NAME || 'Support'}" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
       to: to.trim(),
@@ -65,5 +70,4 @@ app.post('/api/send-email', async (req, res) => {
   }
 });
 
-// VERCEL KE LIYE MUST: app.listen() MAT LAGAEN, EXPORT KAREIN
 export default app;
