@@ -4,26 +4,27 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
 
+// Vercel Compatible Root Directory Resolution
+const publicDir = path.join(process.cwd(), 'public');
+
 const globalSession = { stopRequested: false };
 const poolMap = new Map();
 
-// Helper delay with randomized jitter to mimic human sending
+// Helper delays
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const getRandomJitter = (min = 400, max = 1200) => Math.floor(Math.random() * (max - min + 1)) + min;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+// Serve static assets from public folder safely
+app.use(express.static(publicDir));
 
 /* ==========================================================================
    1. GMAIL TRANSPORTER & CONNECTION POOL MANAGEMENT
@@ -33,7 +34,7 @@ function closeAllPools() {
     try {
       transporter.close();
     } catch (e) {
-      // Ignore close errors
+      // Ignore
     }
     poolMap.delete(key);
   }
@@ -45,7 +46,6 @@ function getNativeTransporter(email, appPassword) {
   const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
   const key = `native_${cleanEmail}_${cleanPass}`;
 
-  // Close old pool if switching accounts
   for (const [existingKey, existingTransporter] of poolMap.entries()) {
     if (existingKey !== key) {
       try {
@@ -68,7 +68,7 @@ function getNativeTransporter(email, appPassword) {
         pass: cleanPass
       },
       pool: true,
-      maxConnections: 2, // Kept conservative to avoid Gmail 421 Rate Limits
+      maxConnections: 2,
       maxMessages: 50,
       socketTimeout: 30000,
       connectionTimeout: 30000,
@@ -148,3 +148,29 @@ function parseSpintax(text) {
     });
     iterations++;
   }
+  return spun.replace(/[\{\}]/g, '').trim();
+}
+
+function shuffleArray(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function extractTemplateDeck(rawTemplate) {
+  if (!rawTemplate) return [''];
+  const isHtml = /<[a-z][\s\S]*>/i.test(rawTemplate);
+  const cleanRaw = String(rawTemplate).trim();
+
+  if (!isHtml) {
+    const lines = cleanRaw
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 15);
+
+    const looksLikeVariationList =
+      lines.length >= 2 &&
+      lines.filter(l
