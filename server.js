@@ -3,123 +3,148 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+const SITE_PASSWORD = process.env.SITE_PASSWORD || 'Y##';
+
+const globalSession = { stopRequested: false };
+const poolMap = new Map();
+
+// Helper delay with randomized jitter to mimic human sending
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const getRandomJitter = (min = 400, max = 1200) => Math.floor(Math.random() * (max - min + 1)) + min;
 
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Serve static assets from public folder
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Root route
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Helper Spintax Parser
-function parseSpintax(text) {
-  const matches = text.match(/{[^{}]*}/g);
-  if (!matches) return text;
-  for (const match of matches) {
-    const choices = match.slice(1, -1).split('|');
-    const randomChoice = choices[Math.floor(Math.random() * choices.length)];
-    text = text.replace(match, randomChoice);
+/* ==========================================================================
+   1. GMAIL TRANSPORTER & CONNECTION POOL MANAGEMENT
+   ========================================================================== */
+function closeAllPools() {
+  for (const [key, transporter] of poolMap.entries()) {
+    try {
+      transporter.close();
+    } catch (e) {
+      // Ignore close errors
+    }
+    poolMap.delete(key);
   }
-  return parseSpintax(text);
 }
 
-// 1. Password Verification Route
-app.post('/api/auth', (req, res) => {
-  const { password } = req.body;
-  const sitePassword = process.env.SITE_PASSWORD || 'admin';
+function getNativeTransporter(email, appPassword) {
+  const cleanEmail = email.toLowerCase().trim();
+  const cleanPass = appPassword.replace(/\s+/g, '').trim();
+  const senderDomain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : 'gmail.com';
+  const key = `native_${cleanEmail}_${cleanPass}`;
 
-  if (password === sitePassword) {
-    return res.json({ success: true });
-  }
-  return res.status(401).json({ success: false, message: 'Invalid Password' });
-});
-
-// 2. SMTP Verification Route
-app.post('/api/verify', async (req, res) => {
-  const { email, appPassword } = req.body;
-
-  if (!email || !appPassword) {
-    return res.status(400).json({ success: false, message: 'Missing credentials' });
-  }
-
-  try {
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: email, pass: appPassword }
-    });
-
-    await transporter.verify();
-    return res.json({ success: true, message: 'SMTP Authenticated' });
-  } catch (error) {
-    return res.status(401).json({ success: false, message: 'Invalid Gmail or App Password' });
-  }
-});
-
-// 3. Real-time Email Stream (Server-Sent Events)
-app.post('/api/send-stream', async (req, res) => {
-  const { email, appPassword, senderName, subject, messageBody, recipients } = req.body;
-
-  if (!email || !appPassword || !recipients || !Array.isArray(recipients)) {
-    return res.status(400).json({ success: false, message: 'Invalid payload' });
-  }
-
-  // Set SSE Headers
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: email, pass: appPassword }
-  });
-
-  const cleanSender = (senderName || "").replace(/"/g, "").trim();
-
-  for (const recipient of recipients) {
-    try {
-      const parsedSubject = parseSpintax(subject);
-      const parsedBody = parseSpintax(messageBody);
-
-      const mailOptions = {
-        from: cleanSender ? `"${cleanSender}" <${email}>` : email,
-        to: recipient,
-        subject: parsedSubject,
-        html: parsedBody.includes('<') && parsedBody.includes('>') ? parsedBody : undefined,
-        text: parsedBody.includes('<') && parsedBody.includes('>') ? undefined : parsedBody
-      };
-
-      const info = await transporter.sendMail(mailOptions);
-      res.write(`data: ${JSON.stringify({ success: true, recipient, messageId: info.messageId })}\n\n`);
-    } catch (err) {
-      res.write(`data: ${JSON.stringify({ success: false, recipient, error: err.message })}\n\n`);
+  // Close old pool if switching accounts
+  for (const [existingKey, existingTransporter] of poolMap.entries()) {
+    if (existingKey !== key) {
+      try {
+        existingTransporter.close();
+      } catch (e) {
+        // Ignore
+      }
+      poolMap.delete(existingKey);
     }
-
-    // Small delay to prevent Gmail rate-limit block
-    await new Promise(resolve => setTimeout(resolve, 150));
   }
 
-  res.write('data: [DONE]\n\n');
-  res.end();
-});
+  if (!poolMap.has(key)) {
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      name: senderDomain,
+      auth: {
+        user: cleanEmail,
+        pass: cleanPass
+      },
+      pool: true,
+      maxConnections: 2, // Kept conservative to avoid Gmail 421 Rate Limits
+      maxMessages: 50,
+      socketTimeout: 30000,
+      connectionTimeout: 30000,
+      tls: {
+        rejectUnauthorized: true,
+        minVersion: 'TLSv1.2'
+      }
+    });
+    poolMap.set(key, transporter);
+  }
 
-app.post('/api/stop', (req, res) => {
-  return res.json({ success: true, message: 'Stopped' });
-});
+  return poolMap.get(key);
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+/* ==========================================================================
+   2. RECIPIENT DATA & SPINTAX ENGINE
+   ========================================================================== */
+function parseRecipientData(input) {
+  let email = '';
+  let rawName = '';
 
-export default app;
+  if (typeof input === 'object' && input !== null) {
+    email = (input.email || input.recipient || '').trim();
+    rawName = (input.name || input.fullName || input.first_name || '').trim();
+  } else if (typeof input === 'string') {
+    const str = input.trim();
+    const angleMatch = str.match(/^(?:"?([^"]*)"?\s)?<([^>]+)>$/);
+    if (angleMatch) {
+      rawName = angleMatch[1] ? angleMatch[1].trim() : '';
+      email = angleMatch[2].trim();
+    } else if (str.includes(',')) {
+      const parts = str.split(',');
+      if (parts[0].includes('@')) {
+        email = parts[0].trim();
+        rawName = parts[1].trim();
+      } else {
+        rawName = parts[0].trim();
+        email = parts[1].trim();
+      }
+    } else {
+      email = str;
+    }
+  }
+
+  if (!rawName && email.includes('@')) {
+    const prefix = email.split('@')[0];
+    rawName = prefix.replace(/[0-9_.-]/g, ' ').trim();
+  }
+
+  const formattedName = rawName
+    ? rawName.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ')
+    : '';
+
+  const firstName = formattedName ? formattedName.split(' ')[0] : '';
+  const domain = email.includes('@') ? email.split('@')[1] : '';
+
+  return {
+    email: email.toLowerCase(),
+    name: formattedName,
+    firstName: firstName,
+    domain: domain
+  };
+}
+
+function parseSpintax(text) {
+  if (!text) return '';
+  let spun = String(text);
+  const regex = /\{([^{}]+)\}/s;
+  let iterations = 0;
+
+  while (regex.test(spun) && iterations < 25) {
+    spun = spun.replace(regex, (_, choices) => {
+      if (!choices.includes('|')) return choices;
+      const options = choices.split('|');
+      const pick = options[Math.floor(Math.random() * options.length)];
+      return pick ? pick.trim() : '';
+    });
+    iterations++;
+  }
