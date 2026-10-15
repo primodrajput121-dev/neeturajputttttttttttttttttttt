@@ -63,7 +63,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Real Double-Click Logout Handler
     if (logoutBtn) {
         logoutBtn.addEventListener('dblclick', () => {
             sessionStorage.removeItem('authenticated');
