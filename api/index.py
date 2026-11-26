@@ -16,16 +16,14 @@ from email.utils import formataddr, make_msgid, formatdate
 from flask import Flask, request, render_template, redirect, url_for, jsonify, session, Response
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Vercel ke liye sahi path ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 app = Flask(
     __name__,
     template_folder=str(BASE_DIR / "templates"),
     static_folder=str(BASE_DIR / "static"),
-    static_url_path="/static"
+    static_url_path="/static",
 )
 
-# Vercel ko yahi chahiye
 handler = app
 application = app
 
@@ -34,9 +32,10 @@ LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip() or "1234"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip()
 
+is_vercel = bool(os.environ.get("VERCEL"))
 app.secret_key = SESSION_SECRET
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=is_vercel,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
@@ -50,26 +49,33 @@ MAX_RECIPIENTS = 25
 MAX_WORKERS = 3
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
+
 def clean(v, limit=250):
     return str(v or "").replace("\r", " ").replace("\n", " ").strip()[:limit]
+
 
 def valid_email(v):
     return isinstance(v, str) and len(v.strip()) <= 254 and bool(EMAIL_RE.fullmatch(v.strip()))
 
+
 def logged_in():
     return session.get("authenticated") is True
+
 
 def error(msg, status=400):
     return jsonify({"success": False, "message": msg}), status
 
+
 def event_line(d):
     return json.dumps(d, ensure_ascii=False) + "\n"
+
 
 def html_to_text(v):
     v = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", v)
     v = re.sub(r"(?i)</\s*(p|div|li|h[1-6])\s*>", "\n", v)
     v = re.sub(r"<[^>]*>", " ", v)
     return re.sub(r"\n{3,}", "\n\n", html.unescape(v)).strip()
+
 
 def normalize_recipient(item):
     if isinstance(item, str):
@@ -88,11 +94,13 @@ def normalize_recipient(item):
         out["hi"] = "Hi"
     return out
 
+
 def personalize(v, r):
     res = str(v or "")
     for k in ("hi", "hello", "thanks", "name", "email", "ref_code"):
         res = res.replace("{{" + k + "}}", r.get(k, ""))
     return res
+
 
 def send_via_resend(to_email, sender_name, subject, body, is_html, r):
     payload = {
@@ -120,6 +128,7 @@ def send_via_resend(to_email, sender_name, subject, body, is_html, r):
             detail = str(e)
         raise Exception(f"Resend error {e.code}: {detail}")
 
+
 def send_via_gmail(gmail, password, sender_name, subject, body, is_html, r):
     time.sleep(random.uniform(0.5, 1.0))
     msg = EmailMessage()
@@ -145,17 +154,20 @@ def send_via_gmail(gmail, password, sender_name, subject, body, is_html, r):
             raise smtplib.SMTPRecipientsRefused(refused)
     return True
 
+
 @app.errorhandler(404)
 def not_found(e):
     if request.path.startswith("/send-batch") or request.path.startswith("/health"):
         return jsonify({"success": False, "message": "Not found"}), 404
     return redirect(url_for("home"))
 
+
 @app.errorhandler(500)
 def server_error(e):
     if request.path.startswith("/send-batch") or request.path.startswith("/health"):
         return jsonify({"success": False, "message": "Server error, please try again."}), 500
     return render_template("login.html", error="Something went wrong. Please login again."), 500
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -170,10 +182,12 @@ def login():
     session["authenticated"] = True
     return redirect(url_for("home"))
 
+
 @app.route("/logout", methods=["GET", "POST"])
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
 
 @app.route("/")
 def home():
@@ -181,18 +195,22 @@ def home():
         return redirect(url_for("login"))
     return render_template("index.html")
 
+
 @app.route("/health")
 def health():
     mode = "Resend (Inbox)" if RESEND_API_KEY and FROM_EMAIL else "Gmail SMTP"
     return jsonify({"status": "ok", "mode": mode, "max_recipients": MAX_RECIPIENTS, "workers": MAX_WORKERS})
 
+
 @app.route("/favicon.ico")
 def favicon():
     return Response("", status=204)
 
+
 @app.route("/sw.js")
 def sw():
     return Response("", mimetype="application/javascript")
+
 
 @app.route("/send-batch", methods=["POST"])
 def send_batch():
@@ -264,6 +282,7 @@ def send_batch():
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Accel-Buffering"] = "no"
     return resp
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
