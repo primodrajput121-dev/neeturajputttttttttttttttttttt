@@ -1,3 +1,4 @@
+
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 :root {
@@ -49,8 +50,6 @@ body {
   border-radius: 9px;
   text-decoration: none;
   font-weight: 700;
-  cursor: pointer;
-  font: inherit;
 }
 
 .dashboard {
@@ -170,8 +169,8 @@ input:disabled { background: #f5f7fb; color: var(--muted); }
 
 .security-heading { margin: 19px 0 14px; font-size: 13px; }
 .consent-row { display: flex; align-items: flex-start; gap: 8px; }
-.consent-row input { margin-top: 3px; width: auto; }
-.consent-row label { font-weight: 400; line-height: 1.5; margin: 0; }
+.consent-row input { margin-top: 3px; }
+.consent-row label { font-weight: 400; line-height: 1.5; }
 .help-text { color: var(--muted); font-size: 11px; line-height: 1.5; }
 
 .right-column { display: grid; gap: 20px; }
